@@ -31,14 +31,16 @@ private class PairwiseRRDD[T: ClassTag](
 
   override def compute(split: Partition, context: TaskContext): Iterator[(Int, Array[Byte])] = {
 
+    val parentIterator = firstParent[T].iterator(split, context)
+
     val pb = RRDD.rWorkerProcessBuilder(rLibDir)
     val proc = pb.start()
 
     RRDD.startStderrThread(proc)
 
-    RRDD.startStdinThread(rLibDir, proc, hashFunc, dataSerialized,
+    val tempFile = RRDD.startStdinThread(rLibDir, proc, hashFunc, dataSerialized,
       functionDependencies, packageNames, broadcastVars,
-      firstParent[T].iterator(split, context), numPartitions,
+      parentIterator, numPartitions,
       split.index)
 
     // Return an iterator that read lines from the process's stdout
@@ -77,7 +79,15 @@ private class PairwiseRRDD[T: ClassTag](
       }
       var _nextObj = read()
 
-      def hasNext = !(_nextObj._1 == 0 && _nextObj._2.length == 0)
+      def hasNext(): Boolean = {
+        val hasMore = !(_nextObj._1 == 0 && _nextObj._2.length == 0)
+        if (!hasMore) {
+          // Delete the temporary file we created as we are done reading it
+          dataStream.close()
+          tempFile.delete()
+        }
+        hasMore
+      }
     }
   }
 
@@ -101,16 +111,17 @@ class RRDD[T: ClassTag](
 
   override def compute(split: Partition, context: TaskContext): Iterator[Array[Byte]] = {
 
+    val parentIterator = firstParent[T].iterator(split, context)
+
     val pb = RRDD.rWorkerProcessBuilder(rLibDir)
     val proc = pb.start()
 
     RRDD.startStderrThread(proc)
 
     // Write -1 in numPartitions to indicate this is a normal RDD
-    RRDD.startStdinThread(rLibDir, proc, func, dataSerialized,
+    val tempFile = RRDD.startStdinThread(rLibDir, proc, func, dataSerialized,
       functionDependencies, packageNames, broadcastVars,
-      firstParent[T].iterator(split, context),
-      numPartitions = -1, split.index)
+      parentIterator, numPartitions = -1, split.index)
 
     // Return an iterator that read lines from the process's stdout
     val inputStream = new BufferedReader(new InputStreamReader(proc.getInputStream))
@@ -147,7 +158,15 @@ class RRDD[T: ClassTag](
       }
       var _nextObj = read()
 
-      def hasNext = _nextObj.length != 0
+      def hasNext(): Boolean = {
+        val hasMore = _nextObj.length != 0
+        if (!hasMore) {
+          // Delete the temporary file we created as we are done reading it
+          dataStream.close()
+          tempFile.delete()
+        }
+        hasMore
+      }
     }
   }
 
@@ -162,14 +181,18 @@ object RRDD {
       appName: String,
       sparkHome: String,
       jars: Array[String],
-      vars: JMap[Object, Object]): JavaSparkContext = {
+      sparkEnvirMap: JMap[Object, Object],
+      sparkExecutorEnvMap: JMap[Object, Object]): JavaSparkContext = {
 
     val sparkConf = new SparkConf().setMaster(master)
                                    .setAppName(appName)
                                    .setSparkHome(sparkHome)
                                    .setJars(jars)
-    for ( (name, value) <- vars) {
+    for ((name, value) <- sparkEnvirMap) {
       sparkConf.set(name.asInstanceOf[String], value.asInstanceOf[String])
+    }
+    for ((name, value) <- sparkExecutorEnvMap) {
+      sparkConf.setExecutorEnv(name.asInstanceOf[String], value.asInstanceOf[String])
     }
     new JavaSparkContext(sparkConf)
   }
@@ -225,25 +248,33 @@ object RRDD {
       broadcastVars: Array[Broadcast[Object]],
       iter: Iterator[T],
       numPartitions: Int,
-      splitIndex: Int) {
+      splitIndex: Int) : File = {
 
-    val tempDir =
-      System.getProperty("spark.local.dir", System.getProperty("java.io.tmpdir")).split(',')(0)
+    val env = SparkEnv.get
+    val conf = env.conf
+    val tempDir = getLocalDir(conf)
     val tempFile = File.createTempFile("rSpark", "out", new File(tempDir))
+    val tempFileIn = File.createTempFile("rSpark", "in", new File(tempDir))
+
     val tempFileName = tempFile.getAbsolutePath()
     val bufferSize = System.getProperty("spark.buffer.size", "65536").toInt
-    val env = SparkEnv.get
 
     // Start a thread to feed the process input from our parent's iterator
     new Thread("stdin writer for R") {
       override def run() {
         SparkEnv.set(env)
-        val stream = new BufferedOutputStream(proc.getOutputStream, bufferSize)
+        val streamStd = new BufferedOutputStream(proc.getOutputStream, bufferSize)
+        val printOutStd = new PrintStream(streamStd)
+        printOutStd.println(tempFileName)
+        printOutStd.println(rLibDir)
+        printOutStd.println(tempFileIn.getAbsolutePath())
+        printOutStd.flush()
+
+        streamStd.close()
+
+        val stream = new BufferedOutputStream(new FileOutputStream(tempFileIn), bufferSize)
         val printOut = new PrintStream(stream)
         val dataOut = new DataOutputStream(stream)
-
-        printOut.println(tempFileName)
-        printOut.println(rLibDir)
 
         dataOut.writeInt(splitIndex)
 
@@ -285,8 +316,82 @@ object RRDD {
             printOut.println(elem)
           }
         }
+
+        printOut.flush()
+        dataOut.flush()
+        stream.flush()
         stream.close()
       }
     }.start()
+
+    tempFile
   }
+
+  def isRunningInYarnContainer(conf: SparkConf): Boolean = {
+    // These environment variables are set by YARN.
+    // For Hadoop 0.23.X, we check for YARN_LOCAL_DIRS (we use this below in getYarnLocalDirs())
+    // For Hadoop 2.X, we check for CONTAINER_ID.
+    System.getenv("CONTAINER_ID") != null || System.getenv("YARN_LOCAL_DIRS") != null
+  }
+
+  /**
+   * Get the path of a temporary directory.  Spark's local directories can be configured through
+   * multiple settings, which are used with the following precedence:
+   *
+   *   - If called from inside of a YARN container, this will return a directory chosen by YARN.
+   *   - If the SPARK_LOCAL_DIRS environment variable is set, this will return a directory from it.
+   *   - Otherwise, if the spark.local.dir is set, this will return a directory from it.
+   *   - Otherwise, this will return java.io.tmpdir.
+   *
+   * Some of these configuration options might be lists of multiple paths, but this method will
+   * always return a single directory.
+   */
+  def getLocalDir(conf: SparkConf): String = {
+    getOrCreateLocalRootDirs(conf)(0)
+  }
+
+  /**
+   * Gets or creates the directories listed in spark.local.dir or SPARK_LOCAL_DIRS,
+   * and returns only the directories that exist / could be created.
+   *
+   * If no directories could be created, this will return an empty list.
+   */
+  def getOrCreateLocalRootDirs(conf: SparkConf): Array[String] = {
+    val confValue = if (isRunningInYarnContainer(conf)) {
+      // If we are in yarn mode, systems can have different disk layouts so we must set it
+      // to what Yarn on this system said was available.
+      getYarnLocalDirs(conf)
+    } else {
+      Option(System.getenv("SPARK_LOCAL_DIRS")).getOrElse(
+        conf.get("spark.local.dir", System.getProperty("java.io.tmpdir")))
+    }
+    val rootDirs = confValue.split(',')
+
+    rootDirs.flatMap { rootDir =>
+      val localDir: File = new File(rootDir)
+      val foundLocalDir = localDir.exists || localDir.mkdirs()
+      if (!foundLocalDir) {
+        None
+      } else {
+        Some(rootDir)
+      }
+    }
+  }
+
+  /** Get the Yarn approved local directories. */
+  def getYarnLocalDirs(conf: SparkConf): String = {
+    // Hadoop 0.23 and 2.x have different Environment variable names for the
+    // local dirs, so lets check both. We assume one of the 2 is set.
+    // LOCAL_DIRS => 2.X, YARN_LOCAL_DIRS => 0.23.X
+    val localDirs = Option(System.getenv("YARN_LOCAL_DIRS"))
+      .getOrElse(Option(System.getenv("LOCAL_DIRS"))
+      .getOrElse(""))
+
+    if (localDirs.isEmpty) {
+      throw new Exception("Yarn Local dirs can't be empty")
+    }
+    localDirs
+  }
+
+
 }

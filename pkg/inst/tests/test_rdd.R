@@ -7,9 +7,28 @@ sc <- sparkR.init()
 nums <- 1:10
 rdd <- parallelize(sc, nums, 2L)
 
+intPairs <- list(list(1L, -1), list(2L, 100), list(2L, 1), list(1L, 200))
+intRdd <- parallelize(sc, intPairs, 2L)
+
+test_that("get number of partitions in RDD", {
+  expect_equal(numPartitions(rdd), 2)
+  expect_equal(numPartitions(intRdd), 2)
+})
+
 test_that("count and length on RDD", {
    expect_equal(count(rdd), 10)
    expect_equal(length(rdd), 10)
+})
+
+test_that("count by values and keys", {
+  mods <- lapply(rdd, function(x) { x %% 3 })
+  actual <- countByValue(mods)
+  expected <- list(list(0, 3L), list(1, 4L), list(2, 3L))
+  expect_equal(actual, expected)
+  
+  actual <- countByKey(intRdd)
+  expected <- list(list(2L, 2L), list(1L, 2L))
+  expect_equal(actual, expected)
 })
 
 test_that("lapply on RDD", {
@@ -22,6 +41,41 @@ test_that("lapplyPartition on RDD", {
   sums <- lapplyPartition(rdd, function(part) { sum(unlist(part)) })
   actual <- collect(sums)
   expect_equal(actual, list(15, 40))
+})
+
+test_that("mapPartitions on RDD", {
+  sums <- mapPartitions(rdd, function(part) { sum(unlist(part)) })
+  actual <- collect(sums)
+  expect_equal(actual, list(15, 40))
+})
+
+test_that("flatMap() on RDDs", {
+  flat <- flatMap(intRdd, function(x) { list(x, x) })
+  actual <- collect(flat)
+  expect_equal(actual, rep(intPairs, each=2))
+})
+
+test_that("filterRDD on RDD", {
+  filtered.rdd <- filterRDD(rdd, function(x) { x %% 2 == 0 })
+  actual <- collect(filtered.rdd)
+  expect_equal(actual, list(2, 4, 6, 8, 10))
+  
+  filtered.rdd <- Filter(function(x) { x[[2]] < 0 }, intRdd)
+  actual <- collect(filtered.rdd)
+  expect_equal(actual, list(list(1L, -1)))
+  
+  # Filter out all elements.
+  filtered.rdd <- filterRDD(rdd, function(x) { x > 10 })
+  actual <- collect(filtered.rdd)
+  expect_equal(actual, list())
+})
+
+test_that("lookup on RDD", {
+  vals <- lookup(intRdd, 1L)
+  expect_equal(vals, list(-1, 200))
+  
+  vals <- lookup(intRdd, 3L)
+  expect_equal(vals, list())
 })
 
 test_that("several transformations on RDD (a benchmark on PipelinedRDD)", {
@@ -145,3 +199,66 @@ test_that("takeSample() on RDDs", {
     expect_true(length(unique(s)) < 100L)
   }
 })
+
+test_that("mapValues() on pairwise RDDs", {
+  multiples <- mapValues(intRdd, function(x) { x * 2 })
+  actual <- collect(multiples)
+  expect_equal(actual, lapply(intPairs, function(x) {
+    list(x[[1]], x[[2]] * 2)
+    }))
+})
+
+test_that("flatMapValues() on pairwise RDDs", {
+  l <- parallelize(sc, list(list(1, c(1,2)), list(2, c(3,4))))
+  actual <- collect(flatMapValues(l, function(x) { x }))
+  expect_equal(actual, list(list(1,1), list(1,2), list(2,3), list(2,4)))
+  
+  # Generate x to x+1 for every value
+  actual <- collect(flatMapValues(intRdd, function(x) { x:(x + 1) }))
+  expect_equal(actual, 
+               list(list(1L, -1), list(1L, 0), list(2L, 100), list(2L, 101),
+                    list(2L, 1), list(2L, 2), list(1L, 200), list(1L, 201)))
+})
+
+test_that("distinct() on RDDs", {
+  nums.rep2 <- rep(1:10, 2)
+  rdd.rep2 <- parallelize(sc, nums.rep2, 2L)
+  uniques <- distinct(rdd.rep2)
+  actual <- sort(unlist(collect(uniques)))
+  expect_equal(actual, nums)
+})
+
+test_that("maximum() on RDDs", {
+  max <- maximum(rdd)
+  expect_equal(max, 10)
+})
+
+test_that("minimum() on RDDs", {
+  min <- minimum(rdd)
+  expect_equal(min, 1)
+})
+
+test_that("keys() on RDDs", {
+  keys <- keys(intRdd)
+  actual <- collect(keys)
+  expect_equal(actual, lapply(intPairs, function(x) { x[[1]] }))
+})
+
+test_that("values() on RDDs", {
+  values <- values(intRdd)
+  actual <- collect(values)
+  expect_equal(actual, lapply(intPairs, function(x) { x[[2]] }))
+})
+
+test_that("join() on pairwise RDDs", {
+  rdd1 <- parallelize(sc, list(list(1,1), list(2,4)))
+  rdd2 <- parallelize(sc, list(list(1,2), list(1,3)))
+  actual <- collect(join(rdd1, rdd2, 2L))
+  expect_equal(actual, list(list(1, list(1, 2)), list(1, list(1, 3))))
+
+  rdd1 <- parallelize(sc, list(list("a",1), list("b",4)))
+  rdd2 <- parallelize(sc, list(list("a",2), list("a",3)))
+  actual <- collect(join(rdd1, rdd2, 2L))
+  expect_equal(actual, list(list("a", list(1, 2)), list("a", list(1, 3))))
+})
+

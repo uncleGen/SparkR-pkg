@@ -5,10 +5,14 @@
 *.ear
 .RData
 .Rhistory
+unit-tests.log
+checkpoints/
 target/
 lib/
 work/
 # vim tmps
 .*.swp
+*.*~
+*~
 .Rproj.user
 SparkR-pkg.Rproj

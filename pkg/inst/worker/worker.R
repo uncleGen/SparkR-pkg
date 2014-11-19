@@ -9,18 +9,22 @@ source_local <- function(fname) {
 source_local("serialize.R")
 
 # NOTE: We use "stdin" to get the process stdin instead of the command line
-inputCon  <- file("stdin", open = "rb")
+inputConStdin  <- file("stdin", open = "rb")
 
-outputFileName <- readLines(inputCon, n = 1)
+outputFileName <- readLines(inputConStdin, n = 1)
 outputCon <- file(outputFileName, open="wb")
 
 # Set libPaths to include SparkR package as loadNamespace needs this
 # TODO: Figure out if we can avoid this by not loading any objects that require
 # SparkR namespace
-rLibDir <- readLines(inputCon, n = 1)
+rLibDir <- readLines(inputConStdin, n = 1)
 .libPaths(c(rLibDir, .libPaths()))
 
 suppressPackageStartupMessages(library(SparkR))
+
+inFileName <- readLines(inputConStdin, n = 1)
+
+inputCon <- file(inFileName, open = "rb")
 
 # read the index of the current partition inside the RDD
 splitIndex <- readInt(inputCon)
@@ -46,15 +50,17 @@ if (depsLen > 0) {
   depsFile <- file(depsFileName, open="wb")
   writeBin(execFunctionDeps, depsFile, endian="big")
   close(depsFile)
-
-  load(depsFileName)
-  unlink(depsFileName)
 }
 
 # Include packages as required
 packageNames <- unserialize(readRaw(inputCon))
 for (pkg in packageNames) {
   suppressPackageStartupMessages(require(as.character(pkg), character.only=TRUE))
+}
+
+if (depsLen > 0) {
+	load(depsFileName)
+	unlink(depsFileName)
 }
 
 # Read and set broadcast variables
@@ -100,8 +106,14 @@ if (isEmpty != 0) {
       hashVal <- do.call(execFunctionName, list(tuple[[1]]))
       bucket <- as.character(hashVal %% numPartitions)
       acc <- res[[bucket]]
-      # TODO?: http://stackoverflow.com/questions/2436688/append-an-object-to-a-list-in-r-in-amortized-constant-time
-      acc[[length(acc) + 1]] <- tuple
+      # Create a new accumulator
+      if (is.null(acc)) {
+        acc <- new.env()
+        acc$counter <- 0
+        acc$data <- list(NULL)
+        acc$size <- 1
+      }
+      addItemToAccumulator(acc, tuple)
       res[[bucket]] <- acc
     }
     invisible(lapply(data, hashTupleToEnvir))
@@ -110,7 +122,9 @@ if (isEmpty != 0) {
     for (name in ls(res)) {
       writeInt(outputCon, 2L)
       writeInt(outputCon, as.integer(name))
-      writeRaw(outputCon, res[[name]])
+      # Truncate the accumulator list to the number of elements we have
+      length(res[[name]]$data) <- res[[name]]$counter
+      writeRaw(outputCon, res[[name]]$data)
     }
   }
 }
